@@ -98,6 +98,48 @@ In your GitHub repo → **Settings → Webhooks → Add webhook**:
 
 ---
 
+## 📋 Working Example
+
+Here's CodeSage in action on a real PR:
+
+### Summary Review
+![CodeSage PR Review Summary](docs/codesage-summary.png)
+
+CodeSage analyzes the entire PR and generates a scored report:
+- **Score:** 53/100
+- **Language:** Python
+- **Files Reviewed:** 1
+- **Critical Bugs:** 1 (Division by zero)
+- **Warnings:** 1 (Error handling gap)
+- **Suggestions:** 2 (Missing type hints, Missing docstring)
+
+### Inline Comments
+![CodeSage Inline Comments](docs/codesage-inline-comments.png)
+
+CodeSage posts detailed comments directly on the code:
+
+#### 🔴 Critical Issue: Division by zero
+```python
+def divide(a, b):
+    return a / b   # no zero check
+```
+**Issue:** The function does not check if the divisor is zero, which will raise a `ZeroDivisionError`  
+**Fix:** Add a check for `b == 0` and raise a meaningful error or return a specific value
+
+#### 🟡 Warning: Error handling gap
+Missing try/except blocks for edge cases
+
+#### 💡 Suggestions
+- Add type hints: `def divide(a: float, b: float) -> float:`
+- Add docstring explaining parameters and return type
+
+### Overall Assessment
+> There is 1 critical issue(s) that must be fixed before merging: `Division by zero`. Please address these before requesting re-review.
+
+**Reviewed by:** CodeSage AI · Powered by Groq llama-3-70b
+
+---
+
 ## 📦 Deployment (Permanent URL)
 
 ### Railway
