@@ -82,11 +82,14 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         comment_id     = comment.get("id", 0)
         comment_author = comment.get("user", {}).get("login", "")
 
-        # FIX 1 — Never reply to our own comments (prevents infinite loop)
-        bot_login = payload["repository"]["owner"]["login"]
-        if comment_author.lower() == bot_login.lower():
+        # FIX 1 — Never reply to CodeSage's own comments (prevents infinite loop)
+        # Check for bot indicators in the commenter's username, NOT repo owner
+        if "codesage" in comment_author.lower():
             logger.debug(f"Skipping own comment from {comment_author}")
             return Response(content="own comment", status_code=200)
+
+        if "[bot]" in comment_author.lower():
+            return Response(content="bot comment ignored", status_code=200)
 
         # Also skip if commenter login contains "[bot]"
         if "[bot]" in comment_author.lower() or comment_author.lower().endswith("-bot"):
