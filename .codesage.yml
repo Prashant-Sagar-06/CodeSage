@@ -1,0 +1,36 @@
+# .codesage.yml
+# Drop this file in the ROOT of any repo you want CodeSage to review.
+# All settings are optional — remove any line to use the default.
+
+# ── Files to skip ─────────────────────────────────────────────────────────────
+ignore_files:
+  - "*.md"
+  - "*.txt"
+  - "migrations/*"
+  - "docs/*"
+  - "*.lock"
+
+# ── Review settings ───────────────────────────────────────────────────────────
+# Maximum files to review per PR (default: 15)
+max_files: 10
+
+# Only post inline comments for these severity levels
+# Options: critical, warning, info
+severity_filter:
+  - critical
+  - warning
+
+# Fetch related files for deeper context analysis (default: true)
+context_aware: true
+
+# ── Language ──────────────────────────────────────────────────────────────────
+# Language for review comments: en, hi, es, fr, de, zh (default: en)
+language: en
+
+# ── Slack notifications ───────────────────────────────────────────────────────
+slack_notify: true
+slack_channel: "#code-reviews"
+
+# ── Custom review focus ───────────────────────────────────────────────────────
+# Extra instructions appended to every review prompt
+# custom_instructions: "Pay special attention to async/await usage and database query efficiency."
