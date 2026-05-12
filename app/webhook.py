@@ -195,6 +195,28 @@ async def _process_chat_reply(
         handler = ChatHandler()
 
         pr = analyzer.github.get_pr(repo_name, pr_number)
+
+        # ── DUPLICATE GUARD ───────────────────────────────────────────────────
+        # Check GitHub directly — if bot already replied in last 90 seconds, skip.
+        # This works across all worker processes because it hits the real GitHub API.
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=90)
+        bot_login = analyzer.github.get_bot_login() or ""
+
+        recent_comments = list(pr.get_issue_comments())[-10:]  # last 10 only
+        for c in recent_comments:
+            is_bot = c.user.login.lower() == bot_login.lower()
+            is_recent = c.created_at.replace(tzinfo=timezone.utc) > cutoff
+            is_reply = "CodeSage Reply" in (c.body or "")
+            if is_bot and is_recent and is_reply:
+                logger.info(
+                    f"[Background] Bot already replied on PR #{pr_number} "
+                    f"at {c.created_at}, skipping duplicate"
+                )
+                return
+        # ── END DUPLICATE GUARD ───────────────────────────────────────────────
+
         repo = analyzer.github.get_repo(repo_name)
         config = load_config(repo, ref=pr.head.sha)
 
@@ -208,7 +230,6 @@ async def _process_chat_reply(
             pr.create_issue_comment(reply)
             logger.info(f"[Background] Chat reply posted on PR #{pr_number}")
 
-            # Notify Slack about the chat interaction
             if config.slack_notify:
                 question = handler.extract_question(comment_body)
                 await analyzer.slack.notify_chat_reply(
