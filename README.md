@@ -341,4 +341,4 @@ Update your GitHub webhook URL to the Railway URL. Done — always online, no ng
 
 ---
 
-*Powered by Groq llama-3.3-70b · Built with FastAPI · Made with ❤️*
+*Powered by Groq llama-3.3-70b · Built with FastAPI · Made with ❤️ from Prashant sagar*
