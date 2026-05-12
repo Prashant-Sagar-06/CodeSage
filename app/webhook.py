@@ -21,6 +21,10 @@ router = APIRouter()
 
 HANDLED_PR_ACTIONS = {"opened", "synchronize", "reopened"}
 
+# Idempotency: track comment IDs we already processed this session
+# Prevents duplicate replies when GitHub re-delivers webhooks
+_processed_comment_ids: set[int] = set()
+
 
 # ─── Main webhook endpoint ────────────────────────────────────────────────────
 
@@ -63,32 +67,52 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         return Response(content=f"Review queued for PR #{pr_number}", status_code=202)
 
     # ── Issue comment events (@codesage chat — Feature #1) ────────────────────
+# ── Issue comment events (@codesage chat — Feature #1) ────────────────────
     if event_type == "issue_comment":
         action = payload.get("action", "")
-        # Only handle new comments (not edits/deletes)
         if action != "created":
             return Response(content="ignored", status_code=200)
 
-        # Only handle comments on Pull Requests (not plain issues)
+        # Only on Pull Requests, not plain issues
         if "pull_request" not in payload.get("issue", {}):
             return Response(content="not a PR comment", status_code=200)
 
-        comment_body = payload["issue_comment"]["body"] if "issue_comment" in payload else payload.get("comment", {}).get("body", "")
-        # Fallback for different payload shapes
-        if not comment_body:
-            comment_body = payload.get("comment", {}).get("body", "")
+        comment = payload.get("comment", {})
+        comment_body   = comment.get("body", "")
+        comment_id     = comment.get("id", 0)
+        comment_author = comment.get("user", {}).get("login", "")
+
+        # FIX 1 — Never reply to our own comments (prevents infinite loop)
+        bot_login = payload["repository"]["owner"]["login"]
+        if comment_author.lower() == bot_login.lower():
+            logger.debug(f"Skipping own comment from {comment_author}")
+            return Response(content="own comment", status_code=200)
+
+        # Also skip if commenter login contains "[bot]"
+        if "[bot]" in comment_author.lower() or comment_author.lower().endswith("-bot"):
+            return Response(content="bot comment ignored", status_code=200)
+
+        # FIX 2 — Skip if we already processed this exact comment ID
+        if comment_id in _processed_comment_ids:
+            logger.info(f"Duplicate delivery for comment {comment_id}, skipping")
+            return Response(content="already processed", status_code=200)
 
         from app.chat_handler import ChatHandler
         handler = ChatHandler()
         if not handler.is_codesage_mention(comment_body):
             return Response(content="no mention", status_code=200)
 
-        pr_number  = payload["issue"]["number"]
-        repo_name  = payload["repository"]["full_name"]
-        comment_id = payload.get("comment", {}).get("id") or payload.get("issue_comment", {}).get("id")
-        pr_url     = payload["issue"].get("html_url", "")
+        # Mark as processed BEFORE queuing to block any re-delivery
+        _processed_comment_ids.add(comment_id)
+        # Keep the set small — only remember last 500 comments
+        if len(_processed_comment_ids) > 500:
+            _processed_comment_ids.clear()
 
-        logger.info(f"@codesage mention in {repo_name}#{pr_number}")
+        pr_number = payload["issue"]["number"]
+        repo_name = payload["repository"]["full_name"]
+        pr_url    = payload["issue"].get("html_url", "")
+
+        logger.info(f"@codesage mention in {repo_name}#{pr_number} comment_id={comment_id}")
 
         background_tasks.add_task(
             _process_chat_reply,
