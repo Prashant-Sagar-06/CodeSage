@@ -1,15 +1,10 @@
 """
 webhook.py
-FastAPI server — receives and verifies GitHub PR webhook events.
-
-Key design decisions:
-  - Signature verification (HMAC-SHA256) on every incoming request
-  - Immediate 200 response, then async background processing
-    (GitHub requires a response within 10 seconds or marks delivery as failed)
-  - Idempotency: skips re-reviews for already-reviewed commit SHAs
+Updated FastAPI webhook server — now handles:
+  - Feature #1: PR comment events for @codesage chat
+  - PR opened/updated events (original behaviour)
 """
 
-import asyncio
 import hashlib
 import hmac
 import logging
@@ -18,152 +13,205 @@ import os
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 
 from app.analyzer import Analyzer
+from app.chat_handler import ChatHandler
+from app.config_loader import load_config
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Events we care about
-HANDLED_ACTIONS = {"opened", "synchronize", "reopened"}
+HANDLED_PR_ACTIONS = {"opened", "synchronize", "reopened"}
 
+
+# ─── Main webhook endpoint ────────────────────────────────────────────────────
 
 @router.post("/webhook")
 async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     """
-    Receive GitHub webhook POST requests.
-
-    1. Verify the HMAC-SHA256 signature
-    2. Parse the event type and action
-    3. Acknowledge immediately with 200
-    4. Process the PR in the background
+    Receives all GitHub webhook events.
+    Routes to PR review pipeline or @codesage chat handler.
     """
-    # 1. Read raw body first (must be done before JSON parsing for HMAC)
     body = await request.body()
-
-    # 2. Verify webhook signature
     _verify_signature(body, request.headers.get("X-Hub-Signature-256", ""))
 
-    # 3. Parse event type
     event_type = request.headers.get("X-GitHub-Event", "")
-    if event_type != "pull_request":
-        logger.debug(f"Ignoring non-PR event: {event_type}")
-        return Response(content="ignored", status_code=200)
+    payload = await request.json()
 
-    # 4. Parse payload
-    try:
-        payload = await request.json()
-    except Exception as e:
-        logger.error(f"Failed to parse webhook payload: {e}")
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    # ── Pull Request events (open / update) ───────────────────────────────────
+    if event_type == "pull_request":
+        action = payload.get("action", "")
+        if action not in HANDLED_PR_ACTIONS:
+            return Response(content=f"action '{action}' not handled", status_code=200)
 
-    action = payload.get("action", "")
-    if action not in HANDLED_ACTIONS:
-        logger.debug(f"Ignoring PR action: {action}")
-        return Response(content=f"action '{action}' not handled", status_code=200)
+        pr_number  = payload["pull_request"]["number"]
+        repo_name  = payload["repository"]["full_name"]
+        commit_sha = payload["pull_request"]["head"]["sha"]
+        pr_title   = payload["pull_request"]["title"]
+        pr_author  = payload["pull_request"]["user"]["login"]
+        pr_url     = payload["pull_request"]["html_url"]
 
-    # 5. Extract key identifiers
-    pr_number = payload["pull_request"]["number"]
-    repo_name = payload["repository"]["full_name"]
-    commit_sha = payload["pull_request"]["head"]["sha"]
-    pr_title = payload["pull_request"]["title"]
+        logger.info(f"PR event: {repo_name}#{pr_number} action={action}")
 
-    logger.info(f"Received PR event: {repo_name}#{pr_number} action={action} sha={commit_sha[:7]}")
+        background_tasks.add_task(
+            _process_pr_review,
+            repo_name=repo_name,
+            pr_number=pr_number,
+            commit_sha=commit_sha,
+            pr_title=pr_title,
+            pr_author=pr_author,
+            pr_url=pr_url,
+        )
+        return Response(content=f"Review queued for PR #{pr_number}", status_code=202)
 
-    # 6. Return 200 immediately, then process in background
-    background_tasks.add_task(
-        _process_pr_review,
-        repo_name=repo_name,
-        pr_number=pr_number,
-        commit_sha=commit_sha,
-        pr_title=pr_title,
-    )
+    # ── Issue comment events (@codesage chat — Feature #1) ────────────────────
+    if event_type == "issue_comment":
+        action = payload.get("action", "")
+        # Only handle new comments (not edits/deletes)
+        if action != "created":
+            return Response(content="ignored", status_code=200)
 
-    return Response(
-        content=f"Review queued for PR #{pr_number}",
-        status_code=202,
-    )
+        # Only handle comments on Pull Requests (not plain issues)
+        if "pull_request" not in payload.get("issue", {}):
+            return Response(content="not a PR comment", status_code=200)
+
+        comment_body = payload["issue_comment"]["body"] if "issue_comment" in payload else payload.get("comment", {}).get("body", "")
+        # Fallback for different payload shapes
+        if not comment_body:
+            comment_body = payload.get("comment", {}).get("body", "")
+
+        from app.chat_handler import ChatHandler
+        handler = ChatHandler()
+        if not handler.is_codesage_mention(comment_body):
+            return Response(content="no mention", status_code=200)
+
+        pr_number  = payload["issue"]["number"]
+        repo_name  = payload["repository"]["full_name"]
+        comment_id = payload.get("comment", {}).get("id") or payload.get("issue_comment", {}).get("id")
+        pr_url     = payload["issue"].get("html_url", "")
+
+        logger.info(f"@codesage mention in {repo_name}#{pr_number}")
+
+        background_tasks.add_task(
+            _process_chat_reply,
+            repo_name=repo_name,
+            pr_number=pr_number,
+            comment_body=comment_body,
+            pr_url=pr_url,
+        )
+        return Response(content="Chat reply queued", status_code=202)
+
+    logger.debug(f"Ignoring event: {event_type}")
+    return Response(content="ignored", status_code=200)
 
 
 @router.get("/health")
 async def health_check():
-    """Simple health check endpoint."""
     return {"status": "ok", "service": "codesage-pr-bot"}
 
 
-# ─── Background task ──────────────────────────────────────────────────────────
+# ─── Background tasks ─────────────────────────────────────────────────────────
 
 async def _process_pr_review(
     repo_name: str,
     pr_number: int,
     commit_sha: str,
     pr_title: str,
+    pr_author: str,
+    pr_url: str,
 ) -> None:
-    """Run the full PR analysis pipeline in the background."""
-    logger.info(f"[Background] Starting review for {repo_name}#{pr_number}")
-
+    logger.info(f"[Background] Reviewing {repo_name}#{pr_number}")
     try:
         analyzer = Analyzer()
 
-        # Idempotency: skip if already reviewed this commit
+        # Idempotency check
         pr = analyzer.github.get_pr(repo_name, pr_number)
         bot_login = analyzer.github.get_bot_login()
         if bot_login and analyzer.github.has_already_reviewed(pr, bot_login, commit_sha):
-            logger.info(
-                f"[Background] Skipping — already reviewed commit {commit_sha[:7]} "
-                f"for PR #{pr_number}"
-            )
+            logger.info(f"[Background] Already reviewed {commit_sha[:7]}, skipping")
             return
 
-        # Run analysis
+        # Load config for Slack channel / settings
+        repo = analyzer.github.get_repo(repo_name)
+        config = load_config(repo, ref=commit_sha)
+
         review = await analyzer.analyze_pr(repo_name, pr_number)
         if not review:
-            logger.warning(f"[Background] Analysis returned no review for PR #{pr_number}")
+            logger.warning(f"[Background] No review produced for PR #{pr_number}")
             return
 
-        # Post results to GitHub
-        success = await analyzer.post_review(repo_name, pr_number, review)
-        if success:
-            logger.info(
-                f"[Background] ✅ Review posted for {repo_name}#{pr_number} "
-                f"(score={review.score}, label={review.label})"
-            )
-        else:
-            logger.error(f"[Background] ❌ Failed to post review for PR #{pr_number}")
+        success = await analyzer.post_review(
+            repo_name=repo_name,
+            pr_number=pr_number,
+            review=review,
+            config=config,
+            pr_url=pr_url,
+            pr_title=pr_title,
+            pr_author=pr_author,
+        )
+
+        status = "✅ posted" if success else "❌ failed to post"
+        logger.info(f"[Background] {status} review for PR #{pr_number} (score={review.score if review else 'N/A'})")
 
     except Exception as e:
-        logger.exception(
-            f"[Background] Unhandled error processing PR #{pr_number}: {e}"
+        logger.exception(f"[Background] Error processing PR #{pr_number}: {e}")
+
+
+async def _process_chat_reply(
+    repo_name: str,
+    pr_number: int,
+    comment_body: str,
+    pr_url: str,
+) -> None:
+    """Feature #1 — generate and post a @codesage chat reply."""
+    logger.info(f"[Background] Generating chat reply for {repo_name}#{pr_number}")
+    try:
+        analyzer = Analyzer()
+        handler = ChatHandler()
+
+        pr = analyzer.github.get_pr(repo_name, pr_number)
+        repo = analyzer.github.get_repo(repo_name)
+        config = load_config(repo, ref=pr.head.sha)
+
+        reply = await handler.handle_comment(
+            pr=pr,
+            comment=type("Comment", (), {"body": comment_body})(),
+            language=config.language,
         )
+
+        if reply:
+            pr.create_issue_comment(reply)
+            logger.info(f"[Background] Chat reply posted on PR #{pr_number}")
+
+            # Notify Slack about the chat interaction
+            if config.slack_notify:
+                question = handler.extract_question(comment_body)
+                await analyzer.slack.notify_chat_reply(
+                    repo_name=repo_name,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    question=question,
+                    channel=config.slack_channel,
+                )
+        else:
+            logger.warning(f"[Background] No chat reply generated for PR #{pr_number}")
+
+    except Exception as e:
+        logger.exception(f"[Background] Chat reply error for PR #{pr_number}: {e}")
 
 
 # ─── Signature verification ───────────────────────────────────────────────────
 
 def _verify_signature(body: bytes, signature_header: str) -> None:
-    """
-    Verify the GitHub webhook HMAC-SHA256 signature.
-    Raises HTTPException 401 if verification fails.
-
-    GitHub sets X-Hub-Signature-256: sha256=<hex_digest>
-    """
     secret = os.getenv("WEBHOOK_SECRET", "")
     if not secret:
-        logger.warning("WEBHOOK_SECRET not set — skipping signature verification (UNSAFE)")
+        logger.warning("WEBHOOK_SECRET not set — skipping verification (UNSAFE)")
         return
-
     if not signature_header:
-        raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
-
+        raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256")
     if not signature_header.startswith("sha256="):
         raise HTTPException(status_code=401, detail="Invalid signature format")
 
-    expected_sig = signature_header[len("sha256="):]
-    computed_sig = hmac.new(
-        secret.encode("utf-8"),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
+    expected = signature_header[len("sha256="):]
+    computed = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
-    if not hmac.compare_digest(computed_sig, expected_sig):
-        logger.warning("Webhook signature verification FAILED — possible spoofed request")
-        raise HTTPException(status_code=401, detail="Webhook signature verification failed")
-
-    logger.debug("Webhook signature verified ✓")
+    if not hmac.compare_digest(computed, expected):
+        raise HTTPException(status_code=401, detail="Signature verification failed")
